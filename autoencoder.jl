@@ -20,21 +20,18 @@ const TRAIN_END_YEAR = 2022
 const VALIDATION_YEAR = 2023
 const TEST_YEAR = 2024
 
-# Time Series Window Configuration (1-minute sampling rate)
 const WINDOW_SIZE = 240       # 4 Hours (240 minutes) per block
 const BLOCKS_PER_FILE = 6     # 6 blocks * 240 mins = 1440 mins (1 Day)
 const NUM_VARIABLES = 2       # Temperature (T) and Relative Humidity (RH)
-const LATENT_DIM = 32         # Latent space dimension
+const LATENT_DIM = 32         
 
-# Hyperparameters & Optimization
 const LEARNING_RATE = 1f-3
 const L2_LAMBDA = 1f-5
 const NOISE_FACTOR = 0.1f0  
 const BATCH_SIZE = 64       
 const MAX_EPOCHS = 10
 const EARLY_STOP_PATIENCE = 3
-const ROLLING_WINDOW_DAYS = 7
-const Z_THRESHOLD = 3.5f0   
+const ROLLING_WINDOW_DAYS = 7 # 7-day adaptive window for local seasonality
 
 const OUTPUT_DIRECTORY = joinpath(DATA_DIRECTORY, OUTPUT_NAME)
 
@@ -71,11 +68,11 @@ end
 # Neural Network Architecture
 # ==============================================================================
 
-struct MultiScaleEncoder{S<:Chain, M<:Chain, L<:Chain, D<:Dense}
-    conv_short::S
-    conv_med::M
-    conv_long::L
-    dense_latent::D
+struct MultiScaleEncoder
+    conv_short::Chain
+    conv_med::Chain
+    conv_long::Chain
+    dense_latent::Dense
 end
 
 Flux.@layer MultiScaleEncoder
@@ -103,7 +100,7 @@ function make_decoder(latent_dim::Int, window_size::Int, out_channels::Int)
     return Chain(
         Dense(latent_dim => 32 * (window_size ÷ 4), relu),
         x -> reshape(x, window_size ÷ 4, 32, :),
-        Upsample(4, :nearest), 
+        Upsample(scale=(4,)), 
         Conv((15,), 32 => 16, relu; pad=7),
         Conv((5,), 16 => out_channels; pad=2) 
     )
@@ -116,40 +113,48 @@ function make_autoencoder()
 end
 
 function denoising_mse_loss(model, clean_inputs)
-    noise = randn(Float32, size(clean_inputs)) .* NOISE_FACTOR
+    noise = randn(Float32, size(clean_inputs)...) .* NOISE_FACTOR
     noisy_inputs = clean_inputs .+ noise
     reconstructions = model(noisy_inputs)
     return mean((reconstructions .- clean_inputs) .^ 2)
 end
 
 # ==============================================================================
-# Streaming Anomaly Tracker
+# Robust Seasonally-Adaptive Anomaly Tracker
 # ==============================================================================
 
 mutable struct VesselAnomalyTracker
     vessel_name::String
     window_size_steps::Int
     error_history::Vector{Float32}
-    z_threshold::Float32
 end
 
-function VesselAnomalyTracker(vessel_name::String, window_days::Int, sampling_rate_mins::Int=1; z_threshold::Float32=Z_THRESHOLD)
+function VesselAnomalyTracker(vessel_name::String, window_days::Int, sampling_rate_mins::Int=1)
     steps = (window_days * 24 * 60) ÷ (WINDOW_SIZE * sampling_rate_mins)
-    return VesselAnomalyTracker(vessel_name, steps, Float32[], z_threshold)
+    return VesselAnomalyTracker(vessel_name, steps, Float32[])
 end
 
-function update_and_score!(tracker::VesselAnomalyTracker, raw_mse::Float32)
+function update_and_score!(tracker::VesselAnomalyTracker, raw_mse::Float32, z_threshold::Float32)
     push!(tracker.error_history, raw_mse)
     if length(tracker.error_history) > tracker.window_size_steps
         popfirst!(tracker.error_history)
     end
-    if length(tracker.error_history) < max(2, tracker.window_size_steps ÷ 10)
+    
+    if length(tracker.error_history) < 5
         return 0.0f0, false
     end
-    local_mean = mean(tracker.error_history)
-    local_std  = max(std(tracker.error_history; corrected=false), 1f-5)
+    
+    # Seasonally Robust Baseline: Trim top 10% outlier MSEs in history 
+    # to prevent previous anomalies from inflating local sigma
+    hist_sorted = sort(tracker.error_history)
+    clean_cutoff = max(2, floor(Int, 0.90 * length(hist_sorted)))
+    clean_history = hist_sorted[1:clean_cutoff]
+    
+    local_mean = mean(clean_history)
+    local_std  = max(std(clean_history; corrected=false), 1f-5)
+    
     rolling_z = (raw_mse - local_mean) / local_std
-    return rolling_z, (rolling_z >= tracker.z_threshold)
+    return rolling_z, (rolling_z >= z_threshold)
 end
 
 # ==============================================================================
@@ -210,11 +215,7 @@ function extract_windows(vessels, year_filter)
         date = file_date(file_path)
         (date === nothing || !year_filter(year(date))) && continue
         
-        data = try 
-            read_day_multichannel(file_path) 
-        catch
-            continue
-        end
+        data = try read_day_multichannel(file_path) catch; continue; end
         data === nothing && continue
         sensor_matrix, flags = data
         
@@ -225,23 +226,24 @@ function extract_windows(vessels, year_filter)
             end_idx   = block_idx * WINDOW_SIZE
             
             block_data = zeros(Float32, WINDOW_SIZE, NUM_VARIABLES)
-            block_flag = 0f0
-            
             avail_start = start_idx
             avail_end = min(end_idx, total_file_rows)
             
             if avail_start <= total_file_rows
-                slice_len = avail_end - avail_start + 1
                 raw_slice = sensor_matrix[avail_start:avail_end, :]
-                
                 raw_slice[isnan.(raw_slice)] .= 0f0
                 
                 s_mean = mean(raw_slice, dims=1)
                 s_std  = max.(std(raw_slice, dims=1; corrected=false), 1f-3)
                 normalized_slice = (raw_slice .- s_mean) ./ s_std
                 
+                slice_len = avail_end - avail_start + 1
                 block_data[1:slice_len, :] .= normalized_slice
-                block_flag = flags[avail_end] == 'K' ? 1f0 : 0f0
+                
+                window_flags = flags[avail_start:avail_end]
+                block_flag = any(f -> f == 'K', window_flags) ? 1f0 : 0f0
+            else
+                block_flag = 0f0
             end
             
             push!(all_windows, block_data)
@@ -254,7 +256,6 @@ function extract_windows(vessels, year_filter)
         return Array{Float32, 3}(undef, WINDOW_SIZE, NUM_VARIABLES, 0), Float32[]
     end
     
-    # Efficient 3D tensor pre-allocation (avoids heavy cat(...) splatting allocations)
     packed_windows = Array{Float32, 3}(undef, WINDOW_SIZE, NUM_VARIABLES, n_windows)
     for i in 1:n_windows
         packed_windows[:, :, i] = all_windows[i]
@@ -269,7 +270,9 @@ end
 
 function train_pipeline(model, train_x, val_x)
     sample_count = size(train_x, 3)
-    optimizer = Flux.setup(Adam(LEARNING_RATE), model)
+    opt_rule = OptimiserChain(Adam(LEARNING_RATE), WeightDecay(L2_LAMBDA))
+    optimizer = Flux.setup(opt_rule, model)
+    
     indices = collect(1:sample_count)
     best_loss = Inf
     best_model = deepcopy(model)
@@ -277,8 +280,6 @@ function train_pipeline(model, train_x, val_x)
     
     train_curve = Float64[]
     val_curve = Float64[]
-    
-    l2_penalty(m) = sum(sum(abs2, p) for p in Flux.params(m))
 
     for epoch in 1:MAX_EPOCHS
         shuffle!(indices)
@@ -290,8 +291,9 @@ function train_pipeline(model, train_x, val_x)
             batch_inputs = train_x[:, :, batch_indices]
             
             loss, gradients = Flux.withgradient(model) do m
-                denoising_mse_loss(m, batch_inputs) + L2_LAMBDA * l2_penalty(m)
+                denoising_mse_loss(m, batch_inputs)
             end
+            
             Flux.update!(optimizer, model, gradients[1])
             total_loss += Float64(loss) * length(batch_indices)
         end
@@ -322,7 +324,7 @@ function train_pipeline(model, train_x, val_x)
 end
 
 # ==============================================================================
-# Metrics & Evaluation
+# Threshold Calibration & Metrics Evaluation
 # ==============================================================================
 
 function evaluate_metrics(predictions, ground_truths)
@@ -348,6 +350,40 @@ function evaluate_metrics(predictions, ground_truths)
     return (tp=tp, fn=fn, fp=fp, tn=tn, recall=recall, precision=precision, accuracy=accuracy, f1=f1)
 end
 
+function calibrate_z_threshold(model, val_x, val_labels, window_days)
+    println("\n--- Calibrating Seasonal Z-Score Threshold on Validation Set ---")
+    reconstructions = model(val_x)
+    num_samples = size(val_x, 3)
+    val_mses = Float32[mean((reconstructions[:, :, t] .- val_x[:, :, t]) .^ 2) for t in 1:num_samples]
+    
+    z_candidates = range(0.5f0, 4.0f0, step=0.1f0)
+    best_z = 2.0f0
+    best_f1 = -1.0
+    best_stats = nothing
+
+    for z_test in z_candidates
+        tracker = VesselAnomalyTracker("VALIDATION", window_days)
+        pred_flags = Vector{Bool}(undef, num_samples)
+        
+        for t in 1:num_samples
+            _, pred_flags[t] = update_and_score!(tracker, val_mses[t], z_test)
+        end
+        
+        stats = evaluate_metrics(pred_flags, val_labels)
+        if stats.f1 > best_f1
+            best_f1 = stats.f1
+            best_z = z_test
+            best_stats = stats
+        end
+    end
+    
+    @printf("Calibrated Optimal Z-Threshold: %.2f (Validation F1-Score: %.4f)\n", best_z, best_f1)
+    if best_stats !== nothing
+        @printf("  Val Precision: %.2f%% | Val Recall: %.2f%%\n", best_stats.precision * 100, best_stats.recall * 100)
+    end
+    return best_z
+end
+
 # ==============================================================================
 # Main Program Flow
 # ==============================================================================
@@ -359,7 +395,7 @@ function main()
     train_x, _ = extract_windows(VESSELS, y -> y <= TRAIN_END_YEAR)
     
     println("Extracting Validation Windows ($VALIDATION_YEAR)...")
-    val_x, _ = extract_windows(VESSELS, y -> y == VALIDATION_YEAR)
+    val_x, val_labels = extract_windows(VESSELS, y -> y == VALIDATION_YEAR)
     
     if size(train_x, 3) == 0 || size(val_x, 3) == 0
         error("Extraction layer returned 0 blocks. Ensure your data path is populated correctly.")
@@ -372,12 +408,8 @@ function main()
     serialize(joinpath(OUTPUT_DIRECTORY, "trained_autoencoder.jls"), trained_model)
     println("\n[SAVED] Serialized model exported to output path.")
     
-    p_curves = plot(
-        train_loss, label="Train Loss", title="Autoencoder Learning",
-        xlabel="Epochs", ylabel="MSE Loss", linewidth=2
-    )
-    plot!(p_curves, val_loss, label="Validation Loss", linewidth=2)
-    savefig(p_curves, joinpath(OUTPUT_DIRECTORY, "learning_curves.png"))
+    # Automatically sweep Z-scores on Validation Data to adapt to seasonal variance
+    opt_z_threshold = calibrate_z_threshold(trained_model, val_x, val_labels, ROLLING_WINDOW_DAYS)
     
     for vessel in VESSELS
         println("\nStreaming Inference over $vessel for Test Horizon ($TEST_YEAR)...")
@@ -392,38 +424,15 @@ function main()
         
         for t in 1:num_samples
             raw_mses[t] = mean((reconstructions[:, :, t] .- test_x[:, :, t]) .^ 2)
-            _, pred_flags[t] = update_and_score!(tracker, raw_mses[t])
+            _, pred_flags[t] = update_and_score!(tracker, raw_mses[t], opt_z_threshold)
         end
         
         stats = evaluate_metrics(pred_flags, test_labels)
-        @printf("\n[%s Test Set Metrics Alignment]\n", vessel)
+        @printf("\n[%s Test Set Metrics Alignment (Adaptive Z = %.2f)]\n", vessel, opt_z_threshold)
         @printf("  Accuracy  : %.2f%%\n", stats.accuracy * 100)
         @printf("  Precision : %.2f%%\n", stats.precision * 100)
         @printf("  Recall    : %.2f%%\n", stats.recall * 100)
         @printf("  F1-Score  : %.2f\n", stats.f1)
-        
-        worst_idx = argmax(raw_mses)
-        best_idx  = argmin(raw_mses)
-        
-        p_worst = plot(
-            test_x[:, 1, worst_idx], label="True T",
-            title="Worst 4-Hour Block Profile (Anomaly)",
-            xlabel="Minute Step", ylabel="Normalized Scale"
-        )
-        plot!(p_worst, test_x[:, 2, worst_idx], label="True RH")
-        plot!(p_worst, reconstructions[:, 1, worst_idx], label="Recon T", linestyle=:dash)
-        plot!(p_worst, reconstructions[:, 2, worst_idx], label="Recon RH", linestyle=:dash)
-        savefig(p_worst, joinpath(OUTPUT_DIRECTORY, "$(vessel)_worst_reconstruction.png"))
-        
-        p_best = plot(
-            test_x[:, 1, best_idx], label="True T",
-            title="Best 4-Hour Block Profile (Normal)",
-            xlabel="Minute Step", ylabel="Normalized Scale"
-        )
-        plot!(p_best, test_x[:, 2, best_idx], label="True RH")
-        plot!(p_best, reconstructions[:, 1, best_idx], label="Recon T", linestyle=:dash)
-        plot!(p_best, reconstructions[:, 2, best_idx], label="Recon RH", linestyle=:dash)
-        savefig(p_best, joinpath(OUTPUT_DIRECTORY, "$(vessel)_best_reconstruction.png"))
     end
     
     println("\nPipeline finished successfully. Outputs saved to: $OUTPUT_DIRECTORY")
